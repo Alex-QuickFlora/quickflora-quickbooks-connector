@@ -1,0 +1,17 @@
+# Supabase config snippet — merge into each product's supabase/config.toml.
+#
+# The functions are called from the browser (admin UI) and by Intuit's OAuth
+# redirect, so they cannot require a product JWT. FloraChain runs them open
+# behind the demo policies; products with real auth should either set
+# verify_jwt = true and pass the user's JWT, or keep false and treat
+# tenantId as non-authoritative display data (all writes still happen
+# service-role behind the no-double-post log).
+
+[functions.qbo-auth-callback]
+verify_jwt = false
+
+[functions.qbo-api]
+verify_jwt = false
+
+[functions.qb-scheduler]
+verify_jwt = false
