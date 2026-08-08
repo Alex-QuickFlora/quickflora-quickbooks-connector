@@ -37,12 +37,36 @@ import { supabase } from "../lib/supabase";
 2. The three edge functions are deployed to the product's project
    (`supabase-functions/`, see root README).
 3. A `qb_connector_config` row for the product with the post-connect
-   redirect pointing back at the page hosting this component.
+   redirect pointing back at the page hosting this component — plus the
+   hardening columns from `core/sql/004_sync_results.sql`
+   (`deposit_mode`, `closing_date_mode`, `auto_create_entities`,
+   `clearing_customer_name`), which the panel's Preview/Retry features rely
+   on server-side.
 4. RLS: the component reads/writes `qb_sync_schedule` and reads
-   `qb_sync_run` through the product client. The shipped SQL includes
-   permissive `public` policies — tighten them to your auth model.
-   `qb_connection` stays service-role only by design; the component gets
-   status from the `qbo-api` function.
+   `qb_sync_run` and `qb_push_result` through the product client. The shipped
+   SQL includes permissive `public` policies — tighten them to your auth
+   model. `qb_connection` stays service-role only by design; the component
+   gets status from the `qbo-api` function.
+
+## Panel features (and the API actions behind them)
+
+- Connect/Disconnect — `qbo-auth-callback` start / `qbo-api` `disconnect`.
+- Schedule editor — direct `qb_sync_schedule` upsert.
+- **Preview** — `push-journal` + `push-payments` with `dryRun: true` over the
+  chosen range; shows CREATE / SKIP / FAIL per record. Nothing is written.
+- Sync now — `qbo-api` `run` (manual schedule run for this tenant).
+- Sync history — `qb_sync_run`.
+- **Sync results (per record)** — `qb_push_result`, with `qbo_id` rendered
+  as a deep link into the QBO app.
+- **Retry failed** — `qbo-api` `retry-failed` over the chosen range.
+
+## Deep links into QuickBooks
+
+Result rows link to `https://app(.sandbox).qbo.intuit.com/app/<entity>?txnId=<id>`.
+These only resolve for a user who is logged into that exact QuickBooks
+company in the same browser — otherwise Intuit shows its company picker or a
+login wall. That's Intuit's behavior, not a bug.
+
 
 ## Theming
 

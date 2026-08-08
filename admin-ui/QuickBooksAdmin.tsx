@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useState } from "react";
 import {
-  Alert, Button, Card, Col, Empty, InputNumber, Popconfirm, Row, Segmented,
+  Alert, Button, Card, Col, Empty, Input, InputNumber, Popconfirm, Row, Segmented,
   Select, Space, Spin, Statistic, Switch, Table, Tag, Typography,
   App as AntdApp,
 } from "antd";
 import {
-  CheckCircleOutlined, CloudSyncOutlined, DisconnectOutlined,
+  CheckCircleOutlined, CloudSyncOutlined, DisconnectOutlined, EyeOutlined,
   LinkOutlined, ReloadOutlined, SyncOutlined,
 } from "@ant-design/icons";
 
@@ -54,6 +54,15 @@ interface StatusInfo {
 
 const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
+/** #1223: mirror of core/qbo-client.ts's qboDeepLink — duplicated here so
+ *  this component keeps zero imports beyond React + antd. */
+const QBO_ENTITY_PATHS: Record<string, string> = {
+  journalentry: "journal", invoice: "invoice", bill: "bill",
+  creditmemo: "creditmemo", payment: "customerpayment", deposit: "deposit",
+};
+const qboLink = (sandbox: boolean, entityType: string, qboId: string) =>
+  `${sandbox ? "https://app.sandbox.qbo.intuit.com" : "https://app.qbo.intuit.com"}/app/${QBO_ENTITY_PATHS[entityType] ?? "journal"}?txnId=${encodeURIComponent(qboId)}`;
+
 export const QuickBooksAdmin: React.FC<QuickBooksAdminProps> = ({
   supabaseClient,
   product,
@@ -67,6 +76,13 @@ export const QuickBooksAdmin: React.FC<QuickBooksAdminProps> = ({
   const [status, setStatus] = useState<StatusInfo | null>(null);
   const [schedule, setSchedule] = useState<any | null>(null);
   const [runs, setRuns] = useState<any[]>([]);
+  const [results, setResults] = useState<any[]>([]);
+  const [preview, setPreview] = useState<any[] | null>(null);
+  const [previewRange, setPreviewRange] = useState<[string, string]>(() => {
+    const to = new Date();
+    const from = new Date(to.getTime() - 7 * 86_400_000);
+    return [from.toISOString().slice(0, 10), to.toISOString().slice(0, 10)];
+  });
 
   const callApi = useCallback(
     async (action: string, extra: Record<string, unknown> = {}) => {
@@ -89,15 +105,19 @@ export const QuickBooksAdmin: React.FC<QuickBooksAdminProps> = ({
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [sched, runRows] = await Promise.all([
+      const [sched, runRows, resultRows] = await Promise.all([
         supabaseClient.from("qb_sync_schedule").select("*")
           .eq("product", product).eq("tenant_id", tenantId).maybeSingle(),
         supabaseClient.from("qb_sync_run").select("*")
           .eq("product", product).eq("tenant_id", tenantId)
           .order("started_at", { ascending: false }).limit(20),
+        supabaseClient.from("qb_push_result").select("*")
+          .eq("product", product).eq("tenant_id", tenantId)
+          .order("created_at", { ascending: false }).limit(100),
       ]);
       setSchedule(sched.data ?? null);
       setRuns(runRows.data ?? []);
+      setResults(resultRows.data ?? []);
       try {
         setStatus(await callApi("status"));
       } catch {
@@ -173,6 +193,46 @@ export const QuickBooksAdmin: React.FC<QuickBooksAdminProps> = ({
     }
   };
 
+  /** #1221: dry-run the journal + payment pushes over the chosen range and
+   *  show what WOULD happen, record by record. Nothing is written. */
+  const runPreview = async () => {
+    setBusy(true);
+    setPreview(null);
+    try {
+      const [from, to] = previewRange;
+      const reports = await Promise.all(
+        ["push-journal", "push-payments"].map((action) => callApi(action, { from, to, dryRun: true })),
+      );
+      const rows: any[] = [];
+      for (const r of reports) {
+        for (const w of r.wouldCreate ?? []) rows.push({ key: `c-${r.entityType}-${w.sourceId}`, verdict: "create", entity: r.entityType, ...w });
+        for (const w of r.wouldSkip ?? []) rows.push({ key: `s-${r.entityType}-${w.sourceId}`, verdict: "skip", entity: r.entityType, ...w });
+        for (const w of r.wouldFail ?? []) rows.push({ key: `f-${r.entityType}-${w.sourceId}`, verdict: "fail", entity: r.entityType, ...w });
+      }
+      setPreview(rows);
+      if (!rows.length) message.info("Nothing in that range.");
+    } catch (e: any) {
+      message.error(e.message ?? "Preview failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** #1222: re-push only records whose latest result row is failed. */
+  const retryFailed = async () => {
+    setBusy(true);
+    try {
+      const [from, to] = previewRange;
+      const r = await callApi("retry-failed", { from, to });
+      message.success(`Retried ${r.retried ?? 0} failed record(s).`);
+      await load();
+    } catch (e: any) {
+      message.error(e.message ?? "Retry failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (loading) {
     return <div style={{ padding: 48, textAlign: "center" }}><Spin size="large" /></div>;
   }
@@ -222,8 +282,16 @@ export const QuickBooksAdmin: React.FC<QuickBooksAdminProps> = ({
       )}
 
       <Card size="small" title="Sync schedule" style={{ marginTop: 16 }}
-        extra={<Button type="primary" size="small" icon={<CloudSyncOutlined />}
-          loading={busy} disabled={!status?.connected} onClick={syncNow}>Sync now</Button>}>
+        extra={<Space wrap>
+          <Input type="date" size="small" style={{ width: 150 }} value={previewRange[0]}
+            onChange={(e) => setPreviewRange(([_, to]) => [e.target.value, to])} />
+          <Input type="date" size="small" style={{ width: 150 }} value={previewRange[1]}
+            onChange={(e) => setPreviewRange(([from]) => [from, e.target.value])} />
+          <Button size="small" icon={<EyeOutlined />} loading={busy}
+            disabled={!status?.connected} onClick={runPreview}>Preview</Button>
+          <Button type="primary" size="small" icon={<CloudSyncOutlined />}
+            loading={busy} disabled={!status?.connected} onClick={syncNow}>Sync now</Button>
+        </Space>}>
         <Space wrap size={16}>
           <Switch checked={schedule?.enabled ?? false}
             onChange={(v) => saveSchedule({ enabled: v })} checkedChildren="On" unCheckedChildren="Off" />
@@ -255,6 +323,39 @@ export const QuickBooksAdmin: React.FC<QuickBooksAdminProps> = ({
         )}
       </Card>
 
+      {preview && (
+        <Card size="small" title="Preview — nothing written yet" style={{ marginTop: 16 }}>
+          <Table size="small" rowKey="key" dataSource={preview} pagination={{ pageSize: 20 }}
+            locale={{ emptyText: <Empty description="Nothing in that range." /> }}
+            columns={[
+              { title: "", dataIndex: "verdict", width: 90,
+                render: (v: string) => (
+                  <Tag color={v === "create" ? "green" : v === "fail" ? "red" : "default"}>
+                    {v === "create" ? "CREATE" : v === "fail" ? "FAIL" : "SKIP"}</Tag>
+                ),
+                filters: [
+                  { text: "Create", value: "create" },
+                  { text: "Skip", value: "skip" },
+                  { text: "Fail", value: "fail" },
+                ],
+                onFilter: (v: any, r: any) => r.verdict === v },
+              { title: "Entity", dataIndex: "entity", width: 110, render: (v: string) => <Tag>{v}</Tag> },
+              { title: "Ref", dataIndex: "ref", width: 110, render: (v: string) => <Text strong>{v}</Text> },
+              { title: "Date", dataIndex: "date", width: 110, render: (v: string | undefined) => v ?? "—" },
+              { title: "Lines / reason", ellipsis: true,
+                render: (_: any, r: any) => r.error
+                  ? <Text type="danger" style={{ fontSize: 12 }}>{r.error}</Text>
+                  : r.reason
+                  ? <Text type="secondary" style={{ fontSize: 12 }}>{r.reason}</Text>
+                  : <Text type="secondary" style={{ fontSize: 12 }}>
+                      {(r.lines ?? []).map((l: any) =>
+                        l.qbName ? `${l.qbName} ${l.debit ? `DR ${l.debit}` : l.credit ? `CR ${l.credit}` : l.amount ?? ""}` : (l.memo ?? "")
+                      ).join(" · ")}
+                    </Text> },
+            ]} />
+        </Card>
+      )}
+
       <Card size="small" title="Sync history" style={{ marginTop: 16 }}>
         <Table size="small" rowKey="id" dataSource={runs} pagination={{ pageSize: 10 }}
           locale={{ emptyText: <Empty description="No syncs yet." /> }}
@@ -272,6 +373,47 @@ export const QuickBooksAdmin: React.FC<QuickBooksAdminProps> = ({
             { title: "Payments", dataIndex: "payments_pushed", width: 90, align: "right" },
             { title: "Error", dataIndex: "error", ellipsis: true,
               render: (v: string | null) => v ? <Text type="danger" style={{ fontSize: 12 }}>{v}</Text> : "—" },
+          ]} />
+      </Card>
+
+      {/* #1222/#1223: latest outcome per record, with deep links into QBO
+          and a retry that re-pushes only the failed ones. */}
+      <Card size="small" title="Sync results (per record)" style={{ marginTop: 16 }}
+        extra={<Button size="small" danger icon={<ReloadOutlined />} loading={busy}
+          disabled={!results.some((r) => r.status === "failed")}
+          onClick={retryFailed}>Retry failed</Button>}>
+        <Table size="small" rowKey="id" dataSource={results} pagination={{ pageSize: 10 }}
+          locale={{ emptyText: <Empty description="Nothing pushed yet." /> }}
+          columns={[
+            { title: "Entity", dataIndex: "entity_type", width: 110, render: (v: string) => <Tag>{v}</Tag> },
+            { title: "Ref", dataIndex: "ref", width: 110,
+              render: (v: string | null) => <Text strong>{v ?? "—"}</Text> },
+            { title: "Status", dataIndex: "status", width: 90,
+              render: (v: string, r: any) => (
+                <Space size={4}>
+                  <Tag color={v === "ok" ? "green" : v === "failed" ? "red" : "default"}>{v}</Tag>
+                  {r.warning && <Tag color="orange">warn</Tag>}
+                </Space>
+              ),
+              filters: [
+                { text: "ok", value: "ok" },
+                { text: "failed", value: "failed" },
+                { text: "skipped", value: "skipped" },
+              ],
+              onFilter: (v: any, r: any) => r.status === v },
+            { title: "QBO", dataIndex: "qbo_id", width: 90,
+              render: (v: string | null, r: any) => v ? (
+                <a href={qboLink(status?.sandbox ?? true, r.entity_type, v)}
+                  target="_blank" rel="noreferrer">#{v}</a>
+              ) : "—" },
+            { title: "Error / warning", ellipsis: true,
+              render: (_: any, r: any) => r.error
+                ? <Text type="danger" style={{ fontSize: 12 }}>{r.error}</Text>
+                : r.warning
+                ? <Text type="warning" style={{ fontSize: 12 }}>{r.warning}</Text>
+                : "—" },
+            { title: "When", dataIndex: "created_at", width: 170,
+              render: (v: string) => new Date(v).toLocaleString() },
           ]} />
       </Card>
     </div>
