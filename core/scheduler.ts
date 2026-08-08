@@ -40,6 +40,9 @@ export interface SchedulerDeps {
   adapterFor: (product: string, tenantId: string) => ProductAdapter;
   clientId: string;
   clientSecret: string;
+  /** Stand-in entities for AR/AP journal lines — see QboClient deps. */
+  clearingCustomerName?: string;
+  clearingVendorName?: string;
   hooks?: SchedulerHooks;
   /** Override "now" (testing). */
   now?: Date;
@@ -153,6 +156,8 @@ export async function runDueConnections(deps: SchedulerDeps & {
         tenantId,
         clientId: deps.clientId,
         clientSecret: deps.clientSecret,
+        clearingCustomerName: deps.clearingCustomerName,
+        clearingVendorName: deps.clearingVendorName,
       });
       const session = await client.connect();
 

@@ -41,11 +41,14 @@ serve(async (req) => {
     const product = Deno.env.get("QBO_PRODUCT") ?? "florachain";
     const clientId = Deno.env.get("QBO_CLIENT_ID")!;
     const clientSecret = Deno.env.get("QBO_CLIENT_SECRET")!;
+    // Deployment-level defaults; the connector core itself has no product names.
+    const clearingCustomerName = Deno.env.get("QBO_CLEARING_CUSTOMER") ?? "FloraChain AR Clearing";
+    const clearingVendorName = Deno.env.get("QBO_CLEARING_VENDOR") ?? "FloraChain AP Clearing";
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
     );
-    const client = new QboClient({ supabase, product, tenantId, clientId, clientSecret });
+    const client = new QboClient({ supabase, product, tenantId, clientId, clientSecret, clearingCustomerName, clearingVendorName });
 
     if (body.action === "status") {
       return json({ ok: true, ...(await client.status()) });
@@ -93,6 +96,8 @@ serve(async (req) => {
           }),
         clientId,
         clientSecret,
+        clearingCustomerName,
+        clearingVendorName,
         only: { product, tenantId },
         triggerType: "manual",
       });

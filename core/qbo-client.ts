@@ -42,6 +42,11 @@ export class QboClient {
       tenantId: string;
       clientId: string;
       clientSecret: string;
+      /** QBO requires an Entity on journal lines posting to AR/AP; GL-level
+       * entries carry no counterparty, so these stand in. AR/AP journal
+       * lines fail loudly when unset. */
+      clearingCustomerName?: string;
+      clearingVendorName?: string;
     },
   ) {}
 
@@ -157,9 +162,14 @@ export class QboClient {
     const created: string[] = [];
     for (const a of map) {
       if (existing.has(a.qbName)) continue;
+      // QBO allows one Opening Balance Equity account per company; any other
+      // Equity account must carry an explicit sub-type or creation fails
+      // with validation error 6000.
+      const payload: Record<string, string> = { Name: a.qbName, AccountType: a.qbType };
+      if (a.qbType === "Equity") payload.AccountSubType = "OwnersEquity";
       const res = await this.qbo(session, `/account?minorversion=73`, {
         method: "POST",
-        body: JSON.stringify({ Name: a.qbName, AccountType: a.qbType }),
+        body: JSON.stringify(payload),
       }) as { Account?: { Id?: string } };
       if (res.Account?.Id) {
         existing.set(a.qbName, res.Account.Id);
@@ -204,7 +214,13 @@ export class QboClient {
   ): Promise<PushSummary> {
     const qboIds = await this.accountIds(session);
     const qbNameByCode = new Map(accountMap.map((a) => [a.code, a.qbName]));
+    const qbTypeByCode = new Map(accountMap.map((a) => [a.code, a.qbType]));
     const out: PushSummary = { pushed: [], skipped: [], failed: [] };
+
+    // Resolved on first AR/AP line; QBO refuses journal lines on those
+    // accounts without a customer/vendor Entity.
+    let arCustomerId: string | null = null;
+    let apVendorId: string | null = null;
 
     for (const e of entries) {
       if (await this.alreadyPushed("journalentry", e.sourceId)) {
@@ -224,14 +240,33 @@ export class QboClient {
           postable = false;
           break;
         }
+        const detail: Record<string, unknown> = {
+          PostingType: Number(l.debit) > 0 ? "Debit" : "Credit",
+          AccountRef: { value: qboId },
+        };
+        const qbType = qbTypeByCode.get(l.accountCode);
+        if (qbType === "Accounts Receivable") {
+          if (!this.deps.clearingCustomerName) {
+            out.failed.push({ ref: e.entryNo, error: `entry posts to AR and no clearing customer is configured` });
+            postable = false;
+            break;
+          }
+          arCustomerId ??= await this.customerId(session, this.deps.clearingCustomerName, this.deps.clearingCustomerName);
+          detail.Entity = { Type: "Customer", EntityRef: { value: arCustomerId } };
+        } else if (qbType === "Accounts Payable") {
+          if (!this.deps.clearingVendorName) {
+            out.failed.push({ ref: e.entryNo, error: `entry posts to AP and no clearing vendor is configured` });
+            postable = false;
+            break;
+          }
+          apVendorId ??= await this.vendorId(session, this.deps.clearingVendorName);
+          detail.Entity = { Type: "Vendor", EntityRef: { value: apVendorId } };
+        }
         lines.push({
           DetailType: "JournalEntryLineDetail",
           Amount: Number(l.debit) > 0 ? Number(l.debit) : Number(l.credit),
           Description: l.memo ?? e.memo ?? "",
-          JournalEntryLineDetail: {
-            PostingType: Number(l.debit) > 0 ? "Debit" : "Credit",
-            AccountRef: { value: qboId },
-          },
+          JournalEntryLineDetail: detail,
         });
       }
       if (!postable) continue;
@@ -290,6 +325,22 @@ export class QboClient {
     }) as { Customer?: { Id?: string } };
     if (!created.Customer?.Id) throw new Error(`could not create clearing customer "${clearingCustomerName}"`);
     return created.Customer.Id;
+  }
+
+  /** QBO Vendor DisplayName -> Id, created on first use (clearing vendor). */
+  private async vendorId(session: QboSession, name: string): Promise<string> {
+    const res = await this.qbo(
+      session,
+      `/query?query=${encodeURIComponent(`select Id, DisplayName from vendor where DisplayName = '${name.replace(/'/g, "\\'")}'`)}`,
+    ) as { QueryResponse?: { Vendor?: Array<{ Id: string }> } };
+    const found = res.QueryResponse?.Vendor?.[0]?.Id;
+    if (found) return found;
+    const created = await this.qbo(session, `/vendor?minorversion=73`, {
+      method: "POST",
+      body: JSON.stringify({ DisplayName: name }),
+    }) as { Vendor?: { Id?: string } };
+    if (!created.Vendor?.Id) throw new Error(`could not create clearing vendor "${name}"`);
+    return created.Vendor.Id;
   }
 
   /** Try to link a payment to a QBO Invoice by DocNumber; null = unapplied. */

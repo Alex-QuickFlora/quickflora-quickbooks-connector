@@ -32,6 +32,8 @@ serve(async () => {
         }),
       clientId: Deno.env.get("QBO_CLIENT_ID")!,
       clientSecret: Deno.env.get("QBO_CLIENT_SECRET")!,
+      clearingCustomerName: Deno.env.get("QBO_CLEARING_CUSTOMER") ?? "FloraChain AR Clearing",
+      clearingVendorName: Deno.env.get("QBO_CLEARING_VENDOR") ?? "FloraChain AP Clearing",
       hooks: {
         alert: async (info) => {
           console.error("qb-sync alert", JSON.stringify(info));
