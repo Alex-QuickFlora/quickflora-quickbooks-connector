@@ -83,6 +83,35 @@ Never push a source row twice. Everything the connector creates in QBO is
 recorded in `qb_push_log` with a unique key on
 `(product, tenant_id, entity_type, source_id)`; push paths check the log
 first. Re-running any window — manual, scheduled, backfill — is always safe.
+Both dedupe operations THROW on query error: a broken dedupe check stops the
+run rather than silently re-posting.
+
+## Push actions and modes (hardening, #1221–#1227)
+
+qbo-api actions: `status`, `push-journal`, `push-payments`, `push-invoices`,
+`push-bills`, `push-credit-memos`, `retry-failed`, `dedupe-journal`,
+`trial-balance`, `run`, `disconnect`. Every push action accepts
+`"dryRun": true` (#1221) and answers a DryRunReport (`wouldCreate` /
+`wouldSkip` / `wouldFail`, with resolved QBO account names+ids) without
+writing anything to QBO, `qb_push_log`, or `qb_push_result`.
+
+Per-record outcomes are upserted into **qb_push_result** (#1222) — one row
+per source record ever; a successful retry overwrites the earlier failure.
+`retry-failed` re-pushes only records whose latest result row is `failed`.
+
+`qb_connector_config` knobs (all default to the pre-hardening behavior):
+
+| Key | Values | Story |
+|---|---|---|
+| `deposit_mode` | `direct` (default) / `undeposited` | #1225 — undeposited files payments under Undeposited Funds and the run closes with one grouped QBO Deposit per (date, bank account), recorded as `entity_type='deposit'` |
+| `closing_date_mode` | `warn` (default) / `block` / `off` | #1226 — records dated on/before QBO's CloseBooksDate are flagged or refused |
+| `auto_create_entities` | `strict` (default) / `auto` | #1227 — strict fails missing customers/vendors/accounts; auto creates them (accounts use the map's qbType) |
+| `clearing_customer_name` | text | fallback customer for payments to unknown customers |
+
+Deep links (#1223): `qboDeepLink(sandbox, entityType, qboId)` →
+`https://app(.sandbox).qbo.intuit.com/app/<entity>?txnId=<id>`; the admin
+panel renders every pushed qbo_id as one.
+
 
 ## Sandbox vs production
 
