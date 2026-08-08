@@ -15,8 +15,9 @@
  */
 
 import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
-import type { AdapterFactory, ConnectorConfig, ProductAdapter, QbSyncScheduleRow } from "./contract.ts";
+import type { AdapterFactory, ConnectorConfig, ProductAdapter, PushSummary, QbSyncScheduleRow } from "./contract.ts";
 import { QboClient } from "./qbo-client.ts";
+import { pushOptionsFrom, resolvePushConfig } from "./config.ts";
 
 export interface SchedulerHooks {
   /** 2+ consecutive failures — product wires its own email/webhook here. */
@@ -161,8 +162,15 @@ export async function runDueConnections(deps: SchedulerDeps & {
       });
       const session = await client.connect();
 
+      // Push behavior knobs from qb_connector_config (#1225–#1227); the
+      // clearing names in deps stay the constructor-level default.
+      const pushCfg = await resolvePushConfig(deps.supabase, product);
+      const opts = pushOptionsFrom(pushCfg, { runId: runRow?.id ?? null });
+
       const accountMap = await adapter.getAccountMap();
-      await client.ensureAccounts(session, accountMap);
+      // Auto mode pre-creates mapped accounts up front; in strict mode a
+      // missing account fails the record instead (#1227).
+      if (pushCfg.autoCreate) await client.ensureAccounts(session, accountMap);
 
       // Re-pushes are harmless (qb_push_log blocks double-posting), so the
       // window is simply last_run_at → today, or window_days back on the
@@ -175,7 +183,7 @@ export async function runDueConnections(deps: SchedulerDeps & {
 
       if (sched.push_journal) {
         const entries = await adapter.getJournalEntries(from, to);
-        const summary = await client.pushJournalEntries(session, entries, accountMap);
+        const summary = await client.pushJournalEntries(entries, accountMap, opts) as PushSummary;
         entriesPushed = summary.pushed.length;
         if (summary.failed.length) {
           status = "error";
@@ -184,11 +192,22 @@ export async function runDueConnections(deps: SchedulerDeps & {
       }
       if (sched.push_payments) {
         const payments = await adapter.getPayments(from, to);
-        const summary = await client.pushPayments(session, payments);
+        const summary = await client.pushPayments(payments, { ...opts, depositMode: pushCfg.depositMode }) as PushSummary;
         paymentsPushed = summary.pushed.length;
         if (summary.failed.length) {
           status = "error";
           errorText = `${summary.failed.length} payments failed: ${summary.failed[0].error}`;
+        }
+        // #1225: sweep Undeposited Funds into one deposit per (date, bank).
+        if (pushCfg.depositMode === "undeposited" && summary.pushed.length) {
+          const qboIdBySourceId = new Map(
+            summary.results.filter((r) => r.status === "ok" && r.qboId).map((r) => [r.sourceId, r.qboId!]),
+          );
+          const dep = await client.createDeposits(payments, qboIdBySourceId, opts) as PushSummary;
+          if (dep.failed.length) {
+            status = "error";
+            errorText = `${dep.failed.length} deposits failed: ${dep.failed[0].error}`;
+          }
         }
       }
       await deps.supabase
