@@ -13,6 +13,7 @@ render it where your product keeps its integration settings.
 | `tenantId` | The tenant whose QBO connection is being managed. |
 | `functionsBaseUrl` | `https://<project-ref>.supabase.co/functions/v1` |
 | `publishableKey` | The product project's publishable/anon key (sent as the `apikey` header to the functions). |
+| `connectorKey` | Shared secret sent as `x-connector-key`; required for write actions (Sync Now, Retry failed, Preview, schedule saves). Demo-phase control — replaced by the user's Auth0 JWT at go-live. |
 
 ## Example (FloraChain)
 
@@ -42,11 +43,11 @@ import { supabase } from "../lib/supabase";
    (`deposit_mode`, `closing_date_mode`, `auto_create_entities`,
    `clearing_customer_name`), which the panel's Preview/Retry features rely
    on server-side.
-4. RLS: the component reads/writes `qb_sync_schedule` and reads
-   `qb_sync_run` and `qb_push_result` through the product client. The shipped
-   SQL includes permissive `public` policies — tighten them to your auth
-   model. `qb_connection` stays service-role only by design; the component
-   gets status from the `qbo-api` function.
+4. RLS: the component READS `qb_sync_schedule`, `qb_sync_run` and
+   `qb_push_result` through the product client (SELECT-only public policies
+   per `core/sql/005_lockdown.sql`). Schedule WRITES go through the keyed
+   `save-schedule` action on `qbo-api`. `qb_connection` stays service-role
+   only by design; the component gets status from the `qbo-api` function.
 
 ## Panel features (and the API actions behind them)
 

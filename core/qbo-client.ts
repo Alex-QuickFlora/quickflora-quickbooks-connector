@@ -72,6 +72,21 @@ export function qboDeepLink(sandbox: boolean, entityType: string, qboId: string)
   return `${host}/app/${path}?txnId=${encodeURIComponent(qboId)}`;
 }
 
+/**
+ * RED 3 (crash-window double-post): the unique reference field each entity
+ * type carries, used to ask QBO "does this already exist?" before creating.
+ * Payment's reference field is PaymentRefNum, not DocNumber. Deposits carry
+ * no unique reference — their idempotent source_id in qb_push_log is the
+ * only guard.
+ */
+const ENTITY_DOC_FIELD: Record<string, { entity: string; field: string }> = {
+  journalentry: { entity: "journalentry", field: "DocNumber" },
+  invoice: { entity: "invoice", field: "DocNumber" },
+  bill: { entity: "bill", field: "DocNumber" },
+  creditmemo: { entity: "creditmemo", field: "DocNumber" },
+  payment: { entity: "payment", field: "PaymentRefNum" },
+};
+
 /** CloseBooksDate cache: one Preferences read per connection per day (#1226). */
 const closingDateCache = new Map<string, string | null>();
 
@@ -413,6 +428,22 @@ export class QboClient {
     );
   }
 
+  /** RED 3: find an existing QBO entity by its unique reference field. */
+  private async findByDocNumber(
+    session: QboSession,
+    entityType: string,
+    docNumber: string,
+  ): Promise<{ id: string; syncToken: string } | null> {
+    const spec = ENTITY_DOC_FIELD[entityType];
+    if (!spec) return null;
+    const res = await this.qbo(
+      session,
+      `/query?query=${encodeURIComponent(`select Id, SyncToken from ${spec.entity} where ${spec.field} = '${docNumber.replace(/'/g, "\\'")}' maxresults 1`)}`,
+    ) as { QueryResponse?: Record<string, Array<{ Id: string; SyncToken?: string }> | undefined> };
+    const row = Object.values(res.QueryResponse ?? {})[0]?.[0];
+    return row ? { id: row.Id, syncToken: row.SyncToken ?? "0" } : null;
+  }
+
   /**
    * Generic push runner. `build` returns the QBO entity body plus the
    * dry-run line detail, or an error string (record fails). Everything else —
@@ -442,6 +473,25 @@ export class QboClient {
         out.results.push({ entityType, sourceId, ref, status: "skipped" });
         dry.wouldSkip.push({ ref, sourceId, reason: "already in qb_push_log" });
         continue;
+      }
+
+      // RED 3 crash window: the create succeeded QBO-side but the process
+      // died before qb_push_log recorded it. Ask QBO by DocNumber before
+      // creating — a hit means "already there": adopt its Id into the log
+      // instead of double-posting.
+      if (session && ENTITY_DOC_FIELD[entityType]) {
+        const existing = await this.findByDocNumber(session, entityType, ref);
+        if (existing) {
+          const note = `found in QBO by DocNumber (id ${existing.id}) — adopted, not re-created`;
+          if (opts.dryRun) {
+            dry.wouldSkip.push({ ref, sourceId, reason: note });
+          } else {
+            await this.logPush(entityType, sourceId, existing.id, existing.syncToken);
+          }
+          out.skipped.push(ref);
+          out.results.push({ entityType, sourceId, ref, status: "skipped", qboId: existing.id, warning: note });
+          continue;
+        }
       }
 
       // Closing-date guard (#1226): block fails the record, warn flags it.

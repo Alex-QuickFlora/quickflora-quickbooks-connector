@@ -3,6 +3,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { QboClient } from "../../core/qbo-client.ts";
 import { runDueConnections } from "../../core/scheduler.ts";
 import { pushOptionsFrom, resolvePushConfig } from "../../core/config.ts";
+import { connectorKeyGuard } from "../../core/auth.ts";
 import { adapterFor } from "../../adapters/registry.ts";
 import type { PushSummary } from "../../core/contract.ts";
 
@@ -21,7 +22,16 @@ import type { PushSummary } from "../../core/contract.ts";
  *   { action: "trial-balance", tenantId, from?, to?} → condensed TB report
  *   { action: "run",           tenantId }            → Sync Now (manual run
  *                                                      of this tenant's schedule)
+ *   { action: "run-scheduled" }                      → pg_cron entry point; honors
+ *                                                      next_run_at, {ran:false,reason}
+ *                                                      when nothing is due
+ *   { action: "save-schedule", tenantId, schedule }  → upsert qb_sync_schedule
+ *                                                      (service role; RED 2 lockdown)
  *   { action: "disconnect",    tenantId }            → drop the connection
+ *
+ * AUTH (RED 1): read actions (status, trial-balance) are open; every write
+ * action requires the x-connector-key header to match the CONNECTOR_API_KEY
+ * secret, and fails closed when the secret is unset.
  *
  * Product comes from env QBO_PRODUCT (default "florachain"); the tenant
  * comes from the request body — the OAuth state carries both end-to-end.
@@ -53,8 +63,18 @@ serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
   try {
     const body = await req.json();
+
+    // RED 1: writes require the connector key; reads stay open. Fail closed
+    // when CONNECTOR_API_KEY is unset.
+    const guard = connectorKeyGuard(req, String(body.action ?? ""));
+    if (guard) return guard;
+
+    // run-scheduled is the fleet-wide cron entry point and carries no tenant;
+    // every other action is tenant-scoped.
     const tenantId = body.tenantId;
-    if (!tenantId) return json({ ok: false, error: "tenantId is required" }, 400);
+    if (!tenantId && body.action !== "run-scheduled") {
+      return json({ ok: false, error: "tenantId is required" }, 400);
+    }
 
     const product = Deno.env.get("QBO_PRODUCT") ?? "florachain";
     const clientId = Deno.env.get("QBO_CLIENT_ID")!;
@@ -164,6 +184,56 @@ serve(async (req) => {
         triggerType: "manual",
       });
       return json({ ok: result.failed === 0, ...result });
+    }
+
+    // Scheduled entry point (pg_cron). Runs whatever is due, honoring
+    // next_run_at; answers {ok, ran:false, reason} when nothing is due.
+    if (body.action === "run-scheduled") {
+      const result = await runDueConnections({
+        supabase,
+        adapterFor: (p, t) => makeAdapter(p, t),
+        clientId,
+        clientSecret,
+        clearingCustomerName,
+        clearingVendorName,
+        triggerType: "schedule",
+      });
+      if (result.ran === 0) {
+        const { data: nxt } = await supabase
+          .from("qb_sync_schedule")
+          .select("next_run_at")
+          .eq("enabled", true)
+          .order("next_run_at", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+        return json({ ok: true, ran: false, reason: `not due until ${nxt?.next_run_at}` });
+      }
+      return json({ ok: result.failed === 0, ran: true, ...result });
+    }
+
+    // RED 2: schedule writes go through here (service role) — clients lost
+    // direct table write when qb_sync_schedule was locked down. Whitelisted
+    // fields only.
+    if (body.action === "save-schedule") {
+      const s = body.schedule ?? {};
+      const row = {
+        product,
+        tenant_id: tenantId,
+        enabled: s.enabled ?? true,
+        frequency: ["daily", "weekly", "monthly"].includes(s.frequency) ? s.frequency : "daily",
+        hour_utc: Math.min(23, Math.max(0, Number(s.hour_utc ?? 10))),
+        day_of_week: s.frequency === "weekly" ? s.day_of_week ?? 1 : null,
+        day_of_month: s.frequency === "monthly" ? s.day_of_month ?? 1 : null,
+        push_journal: s.push_journal ?? true,
+        push_payments: s.push_payments ?? false,
+        window_days: Number(s.window_days ?? 60),
+        updated_at: new Date().toISOString(),
+      };
+      const { error } = await supabase
+        .from("qb_sync_schedule")
+        .upsert(row, { onConflict: "product,tenant_id" });
+      if (error) throw error;
+      return json({ ok: true, schedule: row });
     }
 
     return json({ ok: false, error: "unknown action" }, 400);

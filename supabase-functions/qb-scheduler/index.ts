@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { runDueConnections } from "../../core/scheduler.ts";
+import { connectorKeyGuard } from "../../core/auth.ts";
 import { adapterFor } from "../../adapters/registry.ts";
 
 /**
@@ -8,12 +9,17 @@ import { adapterFor } from "../../adapters/registry.ts";
  * scheduled invocation (pg_cron → net.http_post) every 15–60 minutes; the
  * schedule rows themselves decide what is actually due.
  *
+ * AUTH (RED 1): requires x-connector-key = CONNECTOR_API_KEY (fail closed).
+ *
  * Alert hook: posts a JSON alert to QBO_ALERT_WEBHOOK_URL when set (wire
  * that to the product's email/Slack path); otherwise just logs. Products
  * with their own notifications table should replace the hook below.
  */
 
-serve(async () => {
+serve(async (req) => {
+  // This function only ever writes — the key is mandatory, no read actions.
+  const guard = connectorKeyGuard(req, "run-scheduled");
+  if (guard) return guard;
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;

@@ -41,6 +41,14 @@ export interface QuickBooksAdminProps {
   tenantId: string;
   functionsBaseUrl: string;
   publishableKey: string;
+  /**
+   * Connector API key, sent as x-connector-key on write actions (Sync Now,
+   * Retry failed, Preview is a read-only dryRun but is served by push
+   * actions, so it needs the key too, as does save-schedule). RED 1 control:
+   * the functions reject writes without it. At go-live this is replaced by
+   * the user's Auth0 JWT.
+   */
+  connectorKey?: string;
 }
 
 interface StatusInfo {
@@ -69,6 +77,7 @@ export const QuickBooksAdmin: React.FC<QuickBooksAdminProps> = ({
   tenantId,
   functionsBaseUrl,
   publishableKey,
+  connectorKey,
 }) => {
   const { message } = AntdApp.useApp();
   const [loading, setLoading] = useState(true);
@@ -92,6 +101,7 @@ export const QuickBooksAdmin: React.FC<QuickBooksAdminProps> = ({
           "Content-Type": "application/json",
           apikey: publishableKey,
           Authorization: `Bearer ${publishableKey}`,
+          ...(connectorKey ? { "x-connector-key": connectorKey } : {}),
         },
         body: JSON.stringify({ action, tenantId, ...extra }),
       });
@@ -99,7 +109,7 @@ export const QuickBooksAdmin: React.FC<QuickBooksAdminProps> = ({
       if (!res.ok || data?.ok === false) throw new Error(data?.error ?? `qbo-api ${action} failed`);
       return data;
     },
-    [functionsBaseUrl, publishableKey, tenantId],
+    [functionsBaseUrl, publishableKey, tenantId, connectorKey],
   );
 
   const load = useCallback(async () => {
@@ -153,9 +163,9 @@ export const QuickBooksAdmin: React.FC<QuickBooksAdminProps> = ({
     const next = { ...schedule, ...patch };
     setBusy(true);
     try {
+      // RED 2: schedule writes go through the keyed qbo-api action — the
+      // client has no direct write policy on qb_sync_schedule anymore.
       const row = {
-        product,
-        tenant_id: tenantId,
         enabled: next?.enabled ?? true,
         frequency: next?.frequency ?? "daily",
         hour_utc: next?.hour_utc ?? 10,
@@ -164,13 +174,9 @@ export const QuickBooksAdmin: React.FC<QuickBooksAdminProps> = ({
         push_journal: next?.push_journal ?? true,
         push_payments: next?.push_payments ?? false,
         window_days: next?.window_days ?? 60,
-        updated_at: new Date().toISOString(),
       };
-      const { error } = await supabaseClient
-        .from("qb_sync_schedule")
-        .upsert(row, { onConflict: "product,tenant_id" });
-      if (error) throw error;
-      setSchedule(row);
+      await callApi("save-schedule", { schedule: row });
+      setSchedule({ product, tenant_id: tenantId, ...row });
       message.success("Schedule saved.");
     } catch (e: any) {
       message.error(e.message ?? "Could not save the schedule.");

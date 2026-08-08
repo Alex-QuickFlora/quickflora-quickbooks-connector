@@ -57,8 +57,11 @@ never knows which product it serves.
    (must match EXACTLY — the edge gateway rewrites request URLs, so the
    function builds it from `SUPABASE_URL`, never from `req`).
 2. **Secrets**: `supabase secrets set QBO_CLIENT_ID=… QBO_CLIENT_SECRET=…`
-   and `QBO_PRODUCT=<product>` (defaults to `florachain`). Optional:
-   `QBO_POST_CONNECT_REDIRECT`, `QBO_SANDBOX` (fallbacks when
+   and `QBO_PRODUCT=<product>` (defaults to `florachain`). Also set
+   **`CONNECTOR_API_KEY`** — write actions (pushes, run, save-schedule,
+   disconnect, dedupe) require it as the `x-connector-key` header and FAIL
+   CLOSED without it; read actions (`status`, `trial-balance`) stay open.
+   Optional: `QBO_POST_CONNECT_REDIRECT`, `QBO_SANDBOX` (fallbacks when
    `qb_connector_config` has no row), `QBO_ALERT_WEBHOOK_URL` (scheduler
    failure alerts).
 3. **Tables**: run `core/sql/001_new_product_tables.sql` +
