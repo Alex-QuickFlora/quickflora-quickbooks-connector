@@ -1,0 +1,11 @@
+{
+  "name": "quickflora-quickbooks-connector",
+  "version": "0.1.0",
+  "description": "Sunflower Technologies QuickBooks Online connector — one module, every product (Azure Epic #1201).",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "lint": "echo \"no linter configured — Deno-first TypeScript\" && exit 0",
+    "test": "echo \"no tests yet\" && exit 0"
+  }
+}
