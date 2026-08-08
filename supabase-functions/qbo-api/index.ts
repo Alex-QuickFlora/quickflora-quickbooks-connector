@@ -78,6 +78,12 @@ serve(async (req) => {
       return json({ ok: summary.failed.length === 0, ...summary });
     }
 
+    if (body.action === "dedupe-journal") {
+      const session = await client.connect();
+      const result = await client.dedupeJournalEntries(session);
+      return json({ ok: true, ...result });
+    }
+
     if (body.action === "trial-balance") {
       const session = await client.connect();
       return json({ ok: true, accounts: await client.trialBalance(session, body.from, body.to) });

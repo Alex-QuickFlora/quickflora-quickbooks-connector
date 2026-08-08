@@ -179,17 +179,22 @@ export class QboClient {
     return { created };
   }
 
-  /** The no-double-post control: shared qb_push_log, unique per source row. */
+  /** The no-double-post control: shared qb_push_log, unique per source row.
+   * Both operations THROW on query error — a broken dedupe query must stop
+   * the run, never silently report "not pushed yet" (that exact silent
+   * failure double-posted 6 entries on 8/8 when the product column was
+   * missing from qb_push_log). */
   private async alreadyPushed(entityType: string, sourceId: string): Promise<boolean> {
-    const { data } = await this.connFilter(
+    const { data, error } = await this.connFilter(
       this.deps.supabase.from("qb_push_log")
         .select("id").eq("entity_type", entityType).eq("source_id", sourceId),
     );
+    if (error) throw new Error(`qb_push_log dedupe check failed: ${error.message}`);
     return (data?.length ?? 0) > 0;
   }
 
   private async logPush(entityType: string, sourceId: string, qboId: string, syncToken: string) {
-    await this.deps.supabase.from("qb_push_log").insert({
+    const { error } = await this.deps.supabase.from("qb_push_log").insert({
       product: this.deps.product,
       tenant_id: this.deps.tenantId,
       entity_type: entityType,
@@ -197,6 +202,11 @@ export class QboClient {
       qbo_id: qboId,
       sync_token: syncToken,
     });
+    if (error) {
+      throw new Error(
+        `pushed ${entityType} ${sourceId} to QBO (id ${qboId}) but FAILED to record it in qb_push_log: ${error.message} — fix the log before the next run or this record will double-post`,
+      );
+    }
   }
 
   private async noteSync(note: string) {
@@ -325,6 +335,44 @@ export class QboClient {
     }) as { Customer?: { Id?: string } };
     if (!created.Customer?.Id) throw new Error(`could not create clearing customer "${clearingCustomerName}"`);
     return created.Customer.Id;
+  }
+
+  /**
+   * Maintenance: delete QBO journal entries whose DocNumber appears more
+   * than once, keeping the earliest (lowest QBO Id). Exists because a
+   * dedupe failure can only be repaired QBO-side; returns the mapping so
+   * callers can backfill qb_push_log for the kept copies.
+   */
+  async dedupeJournalEntries(session: QboSession): Promise<{
+    kept: Array<{ docNumber: string; qboId: string }>;
+    deleted: Array<{ docNumber: string; qboId: string }>;
+  }> {
+    const res = await this.qbo(
+      session,
+      `/query?query=${encodeURIComponent("select Id, DocNumber from journalentry maxresults 1000")}`,
+    ) as { QueryResponse?: { JournalEntry?: Array<{ Id: string; DocNumber?: string }> } };
+    const byDoc = new Map<string, string[]>();
+    for (const je of res.QueryResponse?.JournalEntry ?? []) {
+      if (!je.DocNumber) continue;
+      byDoc.set(je.DocNumber, [...(byDoc.get(je.DocNumber) ?? []), je.Id]);
+    }
+    const kept: Array<{ docNumber: string; qboId: string }> = [];
+    const deleted: Array<{ docNumber: string; qboId: string }> = [];
+    for (const [docNumber, ids] of byDoc) {
+      if (ids.length < 2) continue;
+      const sorted = ids.slice().sort((a, b) => Number(a) - Number(b));
+      kept.push({ docNumber, qboId: sorted[0] });
+      for (const id of sorted.slice(1)) {
+        const full = await this.qbo(session, `/journalentry/${id}?minorversion=73`) as { JournalEntry?: { Id: string; SyncToken: string } };
+        if (!full.JournalEntry) continue;
+        await this.qbo(session, `/journalentry?operation=delete&minorversion=73`, {
+          method: "POST",
+          body: JSON.stringify({ Id: full.JournalEntry.Id, SyncToken: full.JournalEntry.SyncToken }),
+        });
+        deleted.push({ docNumber, qboId: id });
+      }
+    }
+    return { kept, deleted };
   }
 
   /** QBO Vendor DisplayName -> Id, created on first use (clearing vendor). */
