@@ -80,7 +80,33 @@ By `OrderHeader.PaymentMethodID` (invoiced only):
 | Check | 5 | $649.40 | Sales Receipt |
 
 Transaction types: `Order`/`Order` 8,540, `Order`/`POS` 646, `Wire_Out` 50,
-`Invoice` 4. The 50 `Wire_Out` orders need their own rule (see open questions).
+`Invoice` 4.
+
+**The 50 `Wire_Out` orders are mis-keyed ordinary wholesale orders, not wire
+service orders** (established 2026-08-14; Berkeley is a wholesaler and does not
+run wire-out). Evidence:
+
+- `WireServiceConfigurations` has **zero rows** for Berkeley — wire service was
+  never configured.
+- `OrderWireOutFlorist` has **zero rows** — a real wire-out records a receiving
+  florist.
+- All 44 `OrderWireServiceDetails` rows are empty shells: blank florist name,
+  blank phone, `FullAmountOrder` = 0, `WireServiceID` = `Others` on every row.
+  Ten of the 50 orders have no wire record at all, and 4 of the 44 rows are
+  orphans pointing at order numbers that do not exist.
+- The line items are bulk wholesale stock — e.g. 300 stems at $0.65, 35 at $5.50.
+
+Cause: `Wire_Out` is a row in Berkeley's own delivery-method list, so it appears
+in the ship-method dropdown on the order-entry screen alongside Delivery and
+Pick Up (`POSOEV2.aspx.vb` binds `drpShipMethod` from
+`PopOrderType.PopulateDeliveryMethods(CompanyID, DepartmentID, DivisionID)`).
+Staff pick it by accident. Concentrated in a few users: Rossy 16 orders
+($26,462.43), Marie 12, Christopher 8.
+
+**Connector rule: none.** These post exactly like any other order — Invoice or
+Sales Receipt by payment method. 40 of the 50 are invoiced and carry $43,380.30
+of real revenue already in the books; they must not be filtered out. Removing
+the dropdown option is a separate POS data fix (AB#1515).
 
 ## Source tables
 
@@ -207,12 +233,21 @@ The 4 exceptions need a rule before backfill.
    accounts do these land in? Maria's call.
 6. **The 4 register-paid orders where payment ≠ total** — partial payment,
    overpayment, or data error?
-7. **50 `Wire_Out` orders** — outgoing wire-service orders; own treatment needed.
-8. **929 uninvoiced orders** — confirmed out of scope for v1; they acquire an
+7. ~~50 `Wire_Out` orders~~ — **closed 2026-08-14**: mis-keyed wholesale orders,
+   no special treatment (see above).
+8. **611 backdated invoices** — `InvoiceDate` falls before `OrderDate` on 611 of
+   the 8,311 invoiced orders (7.4%, $190,609.11): Mar 170, Apr 174, May 99,
+   Jun 68, Jul 70, Aug 30. Because the connector keys on `InvoiceDate`, these
+   post into an earlier month than the order was taken, and with
+   `closingDateMode = block` any landing in a month Maria has already closed
+   will be refused. Needs a decision before backfill: post on `InvoiceDate`
+   anyway (matches the CPA's basis and her existing numbers), or clamp to
+   `OrderDate` (diverges from her figures). Recommend the former.
+9. **929 uninvoiced orders** — confirmed out of scope for v1; they acquire an
    invoice number later and get picked up on a subsequent run.
-9. **Berkeley chart of accounts (142 accounts) → QBO** — the account map. Ved
+10. **Berkeley chart of accounts (142 accounts) → QBO** — the account map. Ved
    owns the legacy chart's meaning.
-10. **GL out of balance by $434.13** — harmless for the invoice route, blocking
+11. **GL out of balance by $434.13** — harmless for the invoice route, blocking
     for any future GL route.
 
 ## Guardrails
